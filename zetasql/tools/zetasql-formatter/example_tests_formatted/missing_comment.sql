@@ -8,4 +8,3 @@ FROM
   fuga
   ON hoge.hoge = fuga.fuga;
 -- comment3
-

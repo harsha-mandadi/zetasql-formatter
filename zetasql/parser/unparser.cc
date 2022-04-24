@@ -50,8 +50,8 @@ std::string Unparse(const ASTNode* node) {
 
 std::string UnparseWithComments(const ASTNode* node, std::deque<std::pair<std::string,
                                 ParseLocationPoint>>& parse_tokens) {
-  std::string unparsed_;
-  parser::Unparser unparser(&unparsed_);
+  std::string unparsed;
+  parser::Unparser unparser(&unparsed);
   // Print comments by visitors and pop.
   node->Accept(&unparser, &parse_tokens);
   // Emit left comments in parse_tokens.
@@ -59,7 +59,10 @@ std::string UnparseWithComments(const ASTNode* node, std::deque<std::pair<std::s
     unparser.print(parse_token.first);
   }
   unparser.FlushLine();
-  return unparsed_;
+  while (unparsed.back() == '\n' && unparsed.at(unparsed.size() - 2) == '\n') {
+    unparsed.pop_back();
+  }
+  return unparsed;
 }
 
 namespace parser {

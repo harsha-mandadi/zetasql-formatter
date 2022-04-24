@@ -1,0 +1,76 @@
+name: Build
+on: push
+env:
+  cache-version: v1.0.2
+jobs:
+  linux:
+    name: Test the repository on Linux
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v2
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+      - name: Cache
+        uses: pat-s/always-upload-cache@v2.1.5
+        with:
+          path: ~/.cache/bazel
+          key: ${{ env.cache-version }}-${{ runner.os }}-bazelisk-build-${{ hashFiles('./**') }}
+          restore-keys: ${{ env.cache-version }}-${{ runner.os }}-bazelisk-build-
+      - name: Setup
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y gcc-9 g++-9
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-9 900 \
+            --slave /usr/bin/g++ g++ /usr/bin/g++-9
+          bazelisk test --test_output=errors //zetasql/public:sql_formatter_test
+          bazelisk build //zetasql/tools/zetasql-formatter:format
+          sudo cp bazel-bin/zetasql/tools/zetasql-formatter/format zetasql-formatter
+          zip zetasql-formatter_linux_x86_64.zip zetasql-formatter
+      - name: Test
+        run: |
+          cd zetasql/tools/zetasql-formatter
+          ls example_tests | xargs -n1 -I {} sh -c 'cat example_tests/{} | ../../../zetasql-formatter > example_tests_formatted/{}'
+          git diff --exit-code -- '*.sql'
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: zetasql-formatter_linux_x86_64.zip
+          prerelease: true
+          generate_release_notes: true
+  macos:
+    name: Test the repository
+    runs-on: macos-10.15
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v2
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+      - name: Cache
+        uses: pat-s/always-upload-cache@v2.1.5
+        with:
+          path: ~/.cache/bazel
+          key: ${{ env.cache-version }}-${{ runner.os }}-bazelisk-build-${{ hashFiles('./**') }}
+          restore-keys: ${{ env.cache-version }}-${{ runner.os }}-bazelisk-build-
+      - name: Setup
+        run: |
+          export TEST_TMPDIR=~/.cache/bazel
+          CC=g++ bazelisk test --test_output=errors //zetasql/public:sql_formatter_test
+          CC=g++ bazelisk build //zetasql/tools/zetasql-formatter:format
+          sudo cp bazel-bin/zetasql/tools/zetasql-formatter/format zetasql-formatter
+          zip zetasql-formatter_darwin_amd64.zip zetasql-formatter
+      - name: Test
+        run: |
+          cd zetasql/tools/zetasql-formatter
+          ls example_tests | xargs -n1 -I {} sh -c 'cat example_tests/{} | ../../../zetasql-formatter > example_tests_formatted/{}'
+          git diff --exit-code -- '*.sql'
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: zetasql-formatter_darwin_amd64.zip
+          prerelease: true
+          generate_release_notes: true

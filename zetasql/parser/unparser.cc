@@ -32,6 +32,7 @@
 #include "absl/flags/flag.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/strip.h"
 #include "absl/strings/string_view.h"
 #include "zetasql/base/map_util.h"
 
@@ -43,6 +44,20 @@ std::string Unparse(const ASTNode* node) {
   std::string unparsed_;
   parser::Unparser unparser(&unparsed_);
   node->Accept(&unparser, nullptr);
+  unparser.FlushLine();
+  return unparsed_;
+}
+
+std::string UnparseWithComments(const ASTNode* node, std::deque<std::pair<std::string,
+                                ParseLocationPoint>>& parse_tokens) {
+  std::string unparsed_;
+  parser::Unparser unparser(&unparsed_);
+  // Print comments by visitors and pop.
+  node->Accept(&unparser, &parse_tokens);
+  // Emit left comments in parse_tokens.
+  for (const auto& parse_token : parse_tokens) {
+    unparser.print(parse_token.first);
+  }
   unparser.FlushLine();
   return unparsed_;
 }
@@ -172,6 +187,53 @@ void Formatter::FlushLine() {
   buffer_.clear();
 }
 
+void Formatter::EndStatement() {
+  if (last_token_is_comment) {
+    FormatLine("");
+    FormatLine(";");
+  } else {
+    // The result from Unparse always ends with '\n'. Strips whitespaces so ';'
+    // can follow the statement immediately rather than starting a new line.
+    absl::StrAppend(unparsed_, buffer_);
+    buffer_.clear();
+    absl::StripAsciiWhitespace(unparsed_);
+    FormatLine(";");
+  }
+}
+
+// FlushCommentsPassedBy prints comments if they are before the given ParseLocationPoint
+// and returns if comments are emitted.
+bool Formatter::FlushCommentsPassedBy(const ParseLocationPoint point, void* data) {
+  if (data == nullptr) return false;
+  auto parse_tokens = static_cast<std::deque<std::pair<std::string, ParseLocationPoint>>*>(data);
+  // Always !nullptr.
+  /* if (parse_tokens == nullptr) return false; */
+  last_token_is_comment = false;
+  const int size = parse_tokens->size();
+  for (int i = 0; i < size; i++) {
+    if (parse_tokens->front().second >= point) {
+      break;
+    }
+    absl::string_view comment_string_view(parse_tokens->front().first);
+    absl::ConsumeSuffix(&comment_string_view, "\r\n");
+    absl::ConsumeSuffix(&comment_string_view, "\r");
+    absl::ConsumeSuffix(&comment_string_view, "\n");
+    std::string comment_string = std::string(comment_string_view);
+    parse_tokens->pop_front();
+
+    // println if multi-line comments
+    if (!last_token_is_comment && i + 1 < size) {
+      if (parse_tokens->front().second < point) {
+        FlushLine();
+      }
+    }
+
+    FormatLine(comment_string);
+    last_token_is_comment = true;
+  }
+  return last_token_is_comment;
+}
+
 // Unparser -------------------------------------------------------------------
 
 // Helper functions.
@@ -215,9 +277,10 @@ void Unparser::UnparseLeafNode(const ASTLeaf* leaf_node) {
 
 void Unparser::UnparseChildrenWithSeparator(const ASTNode* node, void* data,
                                             const std::string& separator,
-                                            bool break_line) {
+                                            bool break_line,
+                                            bool separator_first) {
   UnparseChildrenWithSeparator(node, data, 0, node->num_children(), separator,
-                               break_line);
+                               break_line, separator_first);
 }
 
 // Unparse children of <node> from indices in the range [<begin>, <end>)
@@ -225,11 +288,17 @@ void Unparser::UnparseChildrenWithSeparator(const ASTNode* node, void* data,
 void Unparser::UnparseChildrenWithSeparator(const ASTNode* node, void* data,
                                             int begin, int end,
                                             const std::string& separator,
-                                            bool break_line) {
+                                            bool break_line,
+                                            bool separator_first) {
   for (int i = begin; i < end; i++) {
     if (i > begin) {
       if (break_line) {
-        println(separator);
+        if (separator_first) {
+          println();
+          print(separator);
+        } else {
+          println(separator);
+        }
       } else {
         print(separator);
       }
@@ -1300,6 +1369,8 @@ void Unparser::visitASTQuery(const ASTQuery* node, void* data) {
     visitASTChildren(node, data);
   }
   PrintCloseParenIfNeeded(node);
+  // ASTQuery always ends parent.
+  formatter_.FlushCommentsPassedBy(node->parent()->GetParseLocationRange().end(), data);
 }
 
 void Unparser::visitASTSetOperation(const ASTSetOperation* node, void* data) {
@@ -1547,10 +1618,29 @@ void Unparser::visitASTGroupBy(const ASTGroupBy* node, void* data) {
   if (node->hint() != nullptr) {
     node->hint()->Accept(this, data);
   }
-  print("BY");
+  println("BY");
   {
     Formatter::Indenter indenter(&formatter_);
-    UnparseVectorWithSeparator(node->grouping_items(), data, ",");
+    std::vector<const ASTIntLiteral*> int_grouping_items;
+    std::vector<const ASTGroupingItem*> other_grouping_items;
+    for (const auto grouping_item : node->grouping_items()) {
+      const auto& expr = grouping_item->expression();
+      if (expr == nullptr) {
+        other_grouping_items.push_back(grouping_item);
+        continue;
+      }
+      const auto& int_item = expr->GetAsOrNull<ASTIntLiteral>();
+      if (int_item == nullptr) {
+        other_grouping_items.push_back(grouping_item);
+        continue;
+      }
+      int_grouping_items.push_back(int_item);
+    }
+    UnparseVectorWithSeparator(absl::Span<const ASTIntLiteral* const>(int_grouping_items), data, ",");
+    if (int_grouping_items.size() > 0 && other_grouping_items.size() > 0) {
+      println(",");
+    }
+    UnparseVectorWithSeparator(absl::Span<const ASTGroupingItem* const>(other_grouping_items), data, ",\n");
   }
 }
 
@@ -1623,8 +1713,18 @@ void Unparser::visitASTHavingModifier(const ASTHavingModifier* node,
 void Unparser::visitASTClampedBetweenModifier(
     const ASTClampedBetweenModifier* node, void* data) {
   println();
-  print("CLAMPED BETWEEN");
-  UnparseChildrenWithSeparator(node, data, 0, node->num_children(), "AND");
+  {
+    Formatter::Indenter indenter(&formatter_);
+    println();
+    print("CLAMPED BETWEEN");
+    for (int i = 0; i < node->num_children(); i++) {
+      node->child(i)->Accept(this, data);
+      if (i < node->num_children() - 1) {
+        println();
+        print("AND");
+      }
+    }
+  }
 }
 
 void Unparser::visitASTWithReportModifier(const ASTWithReportModifier* node,
@@ -1842,7 +1942,11 @@ void Unparser::visitASTStar(const ASTStar* node, void* data) {
 
 void Unparser::visitASTStarExceptList(const ASTStarExceptList* node,
                                       void* data) {
-  UnparseChildrenWithSeparator(node, data, ",");
+  println();
+  {
+    Formatter::Indenter indenter(&formatter_);
+    UnparseChildrenWithSeparator(node, data, ",", true /* break_line */);
+  }
 }
 
 void Unparser::visitASTStarReplaceItem(const ASTStarReplaceItem* node,
@@ -1852,14 +1956,27 @@ void Unparser::visitASTStarReplaceItem(const ASTStarReplaceItem* node,
 
 void Unparser::visitASTStarModifiers(const ASTStarModifiers* node, void* data) {
   if (node->except_list() != nullptr) {
-    print("EXCEPT (");
-    node->except_list()->Accept(this, data);
-    print(")");
+    println();
+    {
+      Formatter::Indenter indenter(&formatter_);
+      println("EXCEPT (");
+      node->except_list()->Accept(this, data);
+      println();
+      print(")");
+    }
   }
   if (!node->replace_items().empty()) {
-    print("REPLACE (");
-    UnparseVectorWithSeparator(node->replace_items(), data, ",");
-    print(")");
+    println();
+    {
+      Formatter::Indenter indenter(&formatter_);
+      println("REPLACE (");
+      {
+        Formatter::Indenter indenter(&formatter_);
+        UnparseVectorWithSeparator(node->replace_items(), data, ",");
+      }
+      println();
+      print(")");
+    }
   }
 }
 
@@ -1936,13 +2053,13 @@ void Unparser::visitASTDotStarWithModifiers(
 
 void Unparser::visitASTOrExpr(const ASTOrExpr* node, void* data) {
   PrintOpenParenIfNeeded(node);
-  UnparseChildrenWithSeparator(node, data, "OR");
+  UnparseChildrenWithSeparator(node, data, "OR", true, true);
   PrintCloseParenIfNeeded(node);
 }
 
 void Unparser::visitASTAndExpr(const ASTAndExpr* node, void* data) {
   PrintOpenParenIfNeeded(node);
-  UnparseChildrenWithSeparator(node, data, "AND");
+  UnparseChildrenWithSeparator(node, data, "AND", true, true);
   PrintCloseParenIfNeeded(node);
 }
 
@@ -2140,9 +2257,19 @@ void Unparser::visitASTBetweenExpression(const ASTBetweenExpression* node,
                                          void* data) {
   PrintOpenParenIfNeeded(node);
   node->child(0)->Accept(this, data);
-  print(absl::StrCat(node->is_not() ? "NOT " : "", "BETWEEN"));
-  UnparseChildrenWithSeparator(node, data, 1, node->num_children(), "AND");
-  PrintCloseParenIfNeeded(node);
+  {
+    Formatter::Indenter indenter(&formatter_);
+    println();
+    print(absl::StrCat(node->is_not() ? "NOT " : "", "BETWEEN"));
+    for (int i = 1; i < node->num_children(); i++) {
+      node->child(i)->Accept(this, data);
+      if (i < node->num_children() - 1) {
+        println();
+        print("AND");
+      }
+    }
+    PrintCloseParenIfNeeded(node);
+  }
 }
 
 void Unparser::visitASTFunctionCall(const ASTFunctionCall* node, void* data) {
@@ -2455,12 +2582,15 @@ void Unparser::visitASTWindowFrame(const ASTWindowFrame* node,
                                    void* data) {
   print(node->GetFrameUnitString());
   if (nullptr != node->end_expr()) {
+    Formatter::Indenter indenter(&formatter_);
+    println();
     print("BETWEEN");
-  }
-  node->start_expr()->Accept(this, data);
-  if (nullptr != node->end_expr()) {
+    node->start_expr()->Accept(this, data);
+    println();
     print("AND");
     node->end_expr()->Accept(this, data);
+  } else {
+    node->start_expr()->Accept(this, data);
   }
 }
 
@@ -3358,7 +3488,7 @@ void Unparser::visitASTCreateIndexStatement(const ASTCreateIndexStatement* node,
 void Unparser::visitASTStatementList(const ASTStatementList* node, void* data) {
   for (const ASTStatement* statement : node->statement_list()) {
     statement->Accept(this, data);
-    println(";");
+    formatter_.EndStatement();
   }
 }
 

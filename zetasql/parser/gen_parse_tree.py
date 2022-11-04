@@ -23,7 +23,7 @@ Still a work in progress.
 
 """
 
-import collections
+import collections.abc
 import enum
 import operator
 import re

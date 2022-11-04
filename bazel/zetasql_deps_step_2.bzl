@@ -367,10 +367,10 @@ py_library(
             http_archive(
                 name = "markupsafe",
                 urls = [
-                    "https://github.com/pallets/markupsafe/archive/1.0.tar.gz",
+                    "https://github.com/pallets/markupsafe/archive/2.1.1.tar.gz",
                 ],
-                sha256 = "dc3938045d9407a73cf9fdd709e2b1defd0588d50ffc85eb0786c095ec846f15",
-                strip_prefix = "markupsafe-1.0/markupsafe",
+                sha256 = "0f83b6d1bf6fa65546221d42715034e7e654845583a84906c5936590f9a7ad8f",
+                strip_prefix = "markupsafe-2.1.1/src/markupsafe",
                 build_file_content = """py_library(
     name = "markupsafe",
     visibility = ["//visibility:public"],
